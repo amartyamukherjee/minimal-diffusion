@@ -118,6 +118,7 @@ class GuassianDiffusion:
         """
         model.eval()
         final = xT
+        u = xT[:,0,:,:]
 
         # sub-sampling timesteps for faster sampling
         timesteps = timesteps or self.timesteps
@@ -133,6 +134,7 @@ class GuassianDiffusion:
         )
 
         for i, t in zip(np.arange(timesteps)[::-1], new_timesteps[::-1]):
+            print(t)
             with torch.no_grad():
                 current_t = torch.tensor([t] * len(final), device=final.device)
                 current_sub_t = torch.tensor([i] * len(final), device=final.device)
@@ -161,6 +163,7 @@ class GuassianDiffusion:
                             scalars.beta_tilde[current_sub_t].sqrt()
                         ) * torch.randn_like(final)
                 final = final.detach()
+                final[:,0,:,:] = u
         return final
 
 
@@ -266,7 +269,8 @@ def sample_N_images(
     N = 64
     # with tqdm(total=N) as pbar:
     #     while num_samples < N:
-    xT = torch.stack([torch.load("dataset/Poisson/seed_"+i+".pt") for i in range(10001,10065)])
+    xT = torch.stack([torch.load("dataset/Poisson/seed_"+str(i)+".pt") for i in range(10001,10065)])
+    xT[:,1,:,:] = torch.randn(xT[:,1,:,:].shape).float()
     y = None
     gen_images = diffusion.sample_from_reverse_process(
         model, xT, sampling_steps, {"y": y}, args.ddim
@@ -276,7 +280,7 @@ def sample_N_images(
 def main():
     parser = argparse.ArgumentParser("Minimal implementation of diffusion models")
     # diffusion model
-    parser.add_argument("--arch", type=str, help="Neural network architecture")
+    parser.add_argument("--arch", type=str, help="Neural network architecture", default="UNet")
     parser.add_argument(
         "--class-cond",
         action="store_true",
@@ -302,7 +306,7 @@ def main():
         help="Sampling using DDIM update step",
     )
     # dataset
-    parser.add_argument("--dataset", type=str)
+    parser.add_argument("--dataset", type=str, default="poisson")
     parser.add_argument("--data-dir", type=str, default="./dataset/")
     # optimizer
     parser.add_argument(
@@ -312,12 +316,12 @@ def main():
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--ema_w", type=float, default=0.9995)
     # sampling/finetuning
-    parser.add_argument("--pretrained-ckpt", type=str, help="Pretrained model ckpt")
+    parser.add_argument("--pretrained-ckpt", type=str, help="Pretrained model ckpt", default="./trained_models/UNet_poisson-epoch_500-timesteps_1000-class_condn_False.pt")
     parser.add_argument("--delete-keys", nargs="+", help="Pretrained model ckpt")
     parser.add_argument(
         "--sampling-only",
         action="store_true",
-        default=False,
+        default=True,
         help="No training, just sample images (will save them in --save-dir)",
     )
     parser.add_argument(
