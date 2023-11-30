@@ -1,5 +1,4 @@
 import os
-import cv2
 import copy
 import math
 import argparse
@@ -197,14 +196,20 @@ def train_one_epoch(
     args,
 ):
     model.train()
-    for step, (images, labels) in enumerate(dataloader):
-        assert (images.max().item() <= 1) and (0 <= images.min().item())
-
+    for step, images in enumerate(dataloader):
         # must use [-1, 1] pixel range for images
-        images, labels = (
-            2 * images.to(args.device) - 1,
-            labels.to(args.device) if args.class_cond else None,
-        )
+        if args.dataset == "poisson":
+            images, labels = (
+                images.to(args.device),
+                labels.to(args.device) if args.class_cond else None,
+            )
+        else:
+            images, labels = images
+            assert (images.max().item() <= 1) and (0 <= images.min().item())
+            images, labels = (
+                2 * images.to(args.device) - 1,
+                labels.to(args.device) if args.class_cond else None,
+            )
         t = torch.randint(diffusion.timesteps, (len(images),), dtype=torch.int64).to(
             args.device
         )
@@ -258,38 +263,15 @@ def sample_N_images(
     Returns: Numpy array with N images and corresponding labels.
     """
     samples, labels, num_samples = [], [], 0
-    num_processes, group = dist.get_world_size(), dist.group.WORLD
-    with tqdm(total=math.ceil(N / (args.batch_size * num_processes))) as pbar:
-        while num_samples < N:
-            if xT is None:
-                xT = (
-                    torch.randn(batch_size, num_channels, image_size, image_size)
-                    .float()
-                    .to(args.device)
-                )
-            if args.class_cond:
-                y = torch.randint(num_classes, (len(xT),), dtype=torch.int64).to(
-                    args.device
-                )
-            else:
-                y = None
-            gen_images = diffusion.sample_from_reverse_process(
-                model, xT, sampling_steps, {"y": y}, args.ddim
-            )
-            samples_list = [torch.zeros_like(gen_images) for _ in range(num_processes)]
-            if args.class_cond:
-                labels_list = [torch.zeros_like(y) for _ in range(num_processes)]
-                dist.all_gather(labels_list, y, group)
-                labels.append(torch.cat(labels_list).detach().cpu().numpy())
-
-            dist.all_gather(samples_list, gen_images, group)
-            samples.append(torch.cat(samples_list).detach().cpu().numpy())
-            num_samples += len(xT) * num_processes
-            pbar.update(1)
-    samples = np.concatenate(samples).transpose(0, 2, 3, 1)[:N]
-    samples = (127.5 * (samples + 1)).astype(np.uint8)
-    return (samples, np.concatenate(labels) if args.class_cond else None)
-
+    N = 64
+    # with tqdm(total=N) as pbar:
+    #     while num_samples < N:
+    xT = torch.stack([torch.load("dataset/Poisson/seed_"+i+".pt") for i in range(10001,10065)])
+    y = None
+    gen_images = diffusion.sample_from_reverse_process(
+        model, xT, sampling_steps, {"y": y}, args.ddim
+    )
+    return (gen_images, None)
 
 def main():
     parser = argparse.ArgumentParser("Minimal implementation of diffusion models")
@@ -347,15 +329,16 @@ def main():
 
     # misc
     parser.add_argument("--save-dir", type=str, default="./trained_models/")
-    parser.add_argument("--local_rank", default=0, type=int)
+    parser.add_argument("--local-rank", default=0, type=int)
     parser.add_argument("--seed", default=112233, type=int)
 
     # setup
     args = parser.parse_args()
     metadata = get_metadata(args.dataset)
-    torch.backends.cudnn.benchmark = True
-    args.device = "cuda:{}".format(args.local_rank)
-    torch.cuda.set_device(args.device)
+    os.makedirs(args.save_dir, exist_ok=True)
+    # torch.backends.cudnn.benchmark = True
+    args.device = "cpu"
+    # torch.cuda.set_device(args.device)
     torch.manual_seed(args.seed + args.local_rank)
     np.random.seed(args.seed + args.local_rank)
     if args.local_rank == 0:
@@ -395,7 +378,7 @@ def main():
         print(f"Loaded pretrained model from {args.pretrained_ckpt}")
 
     # distributed training
-    ngpus = torch.cuda.device_count()
+    ngpus = 0
     if ngpus > 1:
         if args.local_rank == 0:
             print(f"Using distributed training on {ngpus} gpus.")
@@ -417,14 +400,11 @@ def main():
             metadata.num_classes,
             args,
         )
-        np.savez(
-            os.path.join(
-                args.save_dir,
-                f"{args.arch}_{args.dataset}-{args.sampling_steps}-sampling_steps-{len(sampled_images)}_images-class_condn_{args.class_cond}.npz",
-            ),
-            sampled_images,
-            labels,
-        )
+        torch.save(sampled_images,
+                    os.path.join(
+                        args.save_dir,
+                        f"{args.arch}_{args.dataset}-{args.diffusion_steps}_steps-{args.sampling_steps}-sampling_steps-class_condn_{args.class_cond}.pt",
+                    ))
         return
 
     # Load dataset
@@ -452,27 +432,6 @@ def main():
         if sampler is not None:
             sampler.set_epoch(epoch)
         train_one_epoch(model, train_loader, diffusion, optimizer, logger, None, args)
-        if not epoch % 1:
-            sampled_images, _ = sample_N_images(
-                64,
-                model,
-                diffusion,
-                None,
-                args.sampling_steps,
-                args.batch_size,
-                metadata.num_channels,
-                metadata.image_size,
-                metadata.num_classes,
-                args,
-            )
-            if args.local_rank == 0:
-                cv2.imwrite(
-                    os.path.join(
-                        args.save_dir,
-                        f"{args.arch}_{args.dataset}-{args.diffusion_steps}_steps-{args.sampling_steps}-sampling_steps-class_condn_{args.class_cond}.png",
-                    ),
-                    np.concatenate(sampled_images, axis=1)[:, :, ::-1],
-                )
         if args.local_rank == 0:
             torch.save(
                 model.state_dict(),
@@ -488,7 +447,24 @@ def main():
                     f"{args.arch}_{args.dataset}-epoch_{args.epochs}-timesteps_{args.diffusion_steps}-class_condn_{args.class_cond}_ema_{args.ema_w}.pt",
                 ),
             )
-
-
+        if not epoch % 1:
+            sampled_images, _ = sample_N_images(
+                64,
+                model,
+                diffusion,
+                None,
+                args.sampling_steps,
+                args.batch_size,
+                metadata.num_channels,
+                metadata.image_size,
+                metadata.num_classes,
+                args,
+            )
+            if args.local_rank == 0:
+                torch.save(sampled_images,
+                            os.path.join(
+                                args.save_dir,
+                                f"{args.arch}_{args.dataset}-{args.diffusion_steps}_steps-{args.sampling_steps}-sampling_steps-class_condn_{args.class_cond}.pt",
+                            ))
 if __name__ == "__main__":
     main()

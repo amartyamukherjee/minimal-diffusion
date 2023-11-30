@@ -1,5 +1,6 @@
 import os
 import numpy as np
+import torch
 from PIL import Image
 import scipy, scipy.io
 from easydict import EasyDict
@@ -99,6 +100,16 @@ def get_metadata(name):
                 "num_channels": 3,
             }
         )
+    elif name == "poisson":
+        metadata = EasyDict(
+            {
+                "image_size": 64,
+                "num_classes": 1,
+                "train_images": 10000,
+                "val_images": 0,
+                "num_channels": 2,
+            }
+        )
     else:
         raise ValueError(f"{name} dataset nor supported!")
     return metadata
@@ -129,6 +140,29 @@ class oxford_flowers_dataset(Dataset):
         if self.transform is not None:
             image = self.transform(image)
         return image, target
+
+class PoissonDataset(Dataset):
+    def __init__(self, transform=None):
+        self.folder_path = "dataset/Poisson"
+        self.file_list = [file for file in os.listdir(self.folder_path) if file.endswith('.pt')]
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        file_name = self.file_list[idx]
+        file_path = os.path.join(self.folder_path, file_name)
+        
+        # Load the .pt file
+        data = torch.load(file_path)
+        data.requires_grad = False
+
+        # Apply any transformations if needed
+        if self.transform:
+            data = self.transform(data)
+
+        return data
 
 
 # TODO: Add datasets imagenette/birds/svhn etc etc.
@@ -249,6 +283,16 @@ def get_dataset(name, data_dir, metadata):
         )
         train_set = datasets.ImageFolder(
             data_dir,
+            transform=transform_train,
+        )
+    elif name == "poisson":
+        transform_train = transforms.Compose(
+            [
+                transforms.RandomVerticalFlip(),
+                transforms.RandomHorizontalFlip(),
+            ]
+        )
+        train_set = PoissonDataset(
             transform=transform_train,
         )
     else:
