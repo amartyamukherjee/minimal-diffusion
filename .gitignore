@@ -1,3 +1,4 @@
 /dataset
 /trained_models
+/pde_figs
 *.pyc

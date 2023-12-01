@@ -118,7 +118,7 @@ class GuassianDiffusion:
         """
         model.eval()
         final = xT
-        u = xT[:,0,:,:]
+        f = xT[:,1,:,:]
 
         # sub-sampling timesteps for faster sampling
         timesteps = timesteps or self.timesteps
@@ -163,7 +163,7 @@ class GuassianDiffusion:
                             scalars.beta_tilde[current_sub_t].sqrt()
                         ) * torch.randn_like(final)
                 final = final.detach()
-                final[:,0,:,:] = u
+                final[:,1,:,:] = f
         return final
 
 
@@ -270,7 +270,7 @@ def sample_N_images(
     # with tqdm(total=N) as pbar:
     #     while num_samples < N:
     xT = torch.stack([torch.load("dataset/Poisson/seed_"+str(i)+".pt") for i in range(10001,10065)])
-    xT[:,1,:,:] = torch.randn(xT[:,1,:,:].shape).float()
+    xT[:,0,:,:] = torch.randn(xT[:,0,:,:].shape).float()
     y = None
     gen_images = diffusion.sample_from_reverse_process(
         model, xT, sampling_steps, {"y": y}, args.ddim
