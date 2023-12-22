@@ -3,11 +3,14 @@ import copy
 import math
 import argparse
 import numpy as np
+from scipy import sparse
+from scipy.interpolate import RegularGridInterpolator
 from time import time
 from tqdm import tqdm
 from easydict import EasyDict
 
 import torch
+import torchvision
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -18,6 +21,21 @@ import unets
 
 unsqueeze3x = lambda x: x[..., None, None, None]
 
+# Define the wavenumbers
+kx = 2 * np.pi * np.fft.fftfreq(64, d=1/63)
+ky = 2 * np.pi * np.fft.fftfreq(64, d=1/63)
+
+kx,ky = np.meshgrid(kx, ky)
+
+def laplacian_spectral_bc(u,sigma=1):
+    # Compute the 2D Fourier transform of u
+    u_hat = np.fft.fft2(u[:,:])
+
+    # Compute Laplacian in Fourier space
+    laplacian_u_hat = -(kx**2 + ky**2) * u_hat
+    laplacian_u = np.real(np.fft.ifft2(laplacian_u_hat))
+
+    return np.clip(laplacian_u,-1,1)
 
 class GuassianDiffusion:
     """Gaussian diffusion process with 1) Cosine schedule for beta values (https://arxiv.org/abs/2102.09672)
@@ -45,12 +63,12 @@ class GuassianDiffusion:
         self.get_pred_mean_from_x0_xt = (
             lambda xt, x0, t, scalars: unsqueeze3x(
                 (scalars.alpha_bar[t].sqrt() * scalars.beta[t])
-                / ((1 - scalars.alpha_bar[t]) * scalars.alpha[t].sqrt())
+                / ((1 - scalars.alpha_bar[t]) * np.maximum(scalars.alpha[t],1e-5).sqrt())
             )
             * x0
             + unsqueeze3x(
                 (scalars.alpha[t] - scalars.alpha_bar[t])
-                / ((1 - scalars.alpha_bar[t]) * scalars.alpha[t].sqrt())
+                / ((1 - scalars.alpha_bar[t]) * np.maximum(scalars.alpha[t],1e-5).sqrt())
             )
             * xt
         )
@@ -118,12 +136,12 @@ class GuassianDiffusion:
         """
         model.eval()
         final = xT
-        f = xT[:,1,:,:]
+        u = xT[:,0,:,:]
 
         # sub-sampling timesteps for faster sampling
         timesteps = timesteps or self.timesteps
         new_timesteps = np.linspace(
-            0, self.timesteps - 1, num=timesteps, endpoint=True, dtype=int
+            0, 4*timesteps - 1, num=timesteps, endpoint=True, dtype=int
         )
         alpha_bar = self.scalars["alpha_bar"][new_timesteps]
         new_betas = 1 - (
@@ -163,7 +181,98 @@ class GuassianDiffusion:
                             scalars.beta_tilde[current_sub_t].sqrt()
                         ) * torch.randn_like(final)
                 final = final.detach()
-                final[:,1,:,:] = f
+                final[:,0,:,:] = u
+        return final
+
+    def sample_from_restoration_process(
+        self, model, xT, timesteps=None, model_kwargs={}, ddim=False
+    ):
+        """Sampling images by iterating over all timesteps.
+
+        model: diffusion model
+        xT: Starting noise vector.
+        timesteps: Number of sampling steps (can be smaller the default,
+            i.e., timesteps in the diffusion process).
+        model_kwargs: Additional kwargs for model (using it to feed class label for conditioning)
+        ddim: Use ddim sampling (https://arxiv.org/abs/2010.02502). With very small number of
+            sampling steps, use ddim sampling for better image quality.
+
+        Return: An image tensor with identical shape as XT.
+        """
+        model.eval()
+        final = xT
+        u = xT[:,0,:,:]
+
+        # Restoration arguments
+        sigma_f = model_kwargs["sigma_y"]
+        eta = model_kwargs["eta"]
+        eta_b = model_kwargs["eta_b"]
+
+        # sub-sampling timesteps for faster sampling
+        timesteps = timesteps or self.timesteps
+        new_timesteps = np.linspace(
+            0, 4*timesteps - 1, num=timesteps, endpoint=True, dtype=int
+        )
+        alpha_bar = self.scalars["alpha_bar"][new_timesteps]
+        new_betas = 1 - (
+            alpha_bar / torch.nn.functional.pad(alpha_bar, [1, 0], value=1.0)[:-1]
+        )
+        scalars = self.get_all_scalars(
+            self.alpha_bar_scheduler, timesteps, self.device, new_betas
+        )
+
+        for i, t in zip(np.arange(timesteps)[::-1], new_timesteps[::-1]):
+            print(t)
+            with torch.no_grad():
+                current_t = torch.tensor([t] * len(final), device=final.device)
+                current_sub_t = torch.tensor([i] * len(final), device=final.device)
+
+                x_theta = self.sample_from_reverse_process(
+                    model, final, timesteps=timesteps-t, model_kwargs=model_kwargs, ddim=ddim
+                )
+
+                new_kx = kx.copy()
+                new_ky = ky.copy()
+
+                sigma_t = np.sqrt(scalars["alpha_bar"][current_sub_t - 1])
+                k_index = sigma_t < sigma_f*(kx**2+ky**2)
+                not_k_index = sigma_t >= sigma_f*(kx**2+ky**2)
+                
+                for n in range(x_theta.shape[0]):
+                    u_i = x_theta[n,0,:,:].numpy()
+                    u_bar_i = np.fft.fft2(u_bar_i)
+                    f_theta_i = x_theta[n,1,:,:].numpy()
+                    f_theta_i_bar = np.fft.fft2(f_theta_i)
+
+                    f_theta_i_bar[k_index] = f_theta_i_bar[k_index] + np.sqrt(1-eta**2)*sigma_t*(kx[k_index]**2+ky[k_index]**2)*(u_bar_i[k_index]-f_theta_i_bar[k_index])
+                    f_theta_i_bar[not_k_index] = (1-eta_b)*f_theta_i_bar[not_k_index] + eta_b*u_bar_i[not_k_index]
+
+                pred_epsilon = model(final, current_t, **model_kwargs)
+                # using xt+x0 to derive mu_t, instead of using xt+eps (former is more stable)
+                pred_x0 = self.get_x0_from_xt_eps(
+                    final, pred_epsilon, current_sub_t, scalars
+                )
+                pred_mean = self.get_pred_mean_from_x0_xt(
+                    final, pred_x0, current_sub_t, scalars
+                )
+                if i == 0:
+                    final = pred_mean
+                else:
+                    if ddim:
+                        final = (
+                            unsqueeze3x(scalars["alpha_bar"][current_sub_t - 1]).sqrt()
+                            * pred_x0
+                            + (
+                                1 - unsqueeze3x(scalars["alpha_bar"][current_sub_t - 1])
+                            ).sqrt()
+                            * pred_epsilon
+                        )
+                    else:
+                        final = pred_mean + unsqueeze3x(
+                            scalars.beta_tilde[current_sub_t].sqrt()
+                        ) * torch.randn_like(final)
+                final = final.detach()
+                final[:,0,:,:] = u
         return final
 
 
@@ -267,14 +376,62 @@ def sample_N_images(
     """
     samples, labels, num_samples = [], [], 0
     N = 64
-    # with tqdm(total=N) as pbar:
-    #     while num_samples < N:
-    xT = torch.stack([torch.load("dataset/Poisson/seed_"+str(i)+".pt") for i in range(10001,10065)])
-    xT[:,0,:,:] = torch.randn(xT[:,0,:,:].shape).float()
+    data_list = []
+    for i in range(10001,10065):
+        xT_i = torch.load("dataset/Poisson/seed_"+str(i)+".pt")
+        # Dry sampling of f_T
+        xT_i[1] = 0.0
+        data_list.append(xT_i)
+    xT = torch.stack(data_list)
     y = None
     gen_images = diffusion.sample_from_reverse_process(
         model, xT, sampling_steps, {"y": y}, args.ddim
     )
+    return (gen_images, None)
+
+def restore_N_images(
+    N,
+    model,
+    diffusion,
+    xT=None,
+    sampling_steps=250,
+    batch_size=64,
+    num_channels=3,
+    image_size=32,
+    num_classes=None,
+    args=None,
+):
+    """use this function to sample any number of images from a given
+        diffusion model and diffusion process.
+
+    Args:
+        N : Number of images
+        model : Diffusion model
+        diffusion : Diffusion process
+        xT : Starting instantiation of noise vector.
+        sampling_steps : Number of sampling steps.
+        batch_size : Batch-size for sampling.
+        num_channels : Number of channels in the image.
+        image_size : Image size (assuming square images).
+        num_classes : Number of classes in the dataset (needed for class-conditioned models)
+        args : All args from the argparser.
+
+    Returns: Numpy array with N images and corresponding labels.
+    """
+    samples, labels, num_samples = [], [], 0
+    N = 64
+    data_list = []
+    for i in range(10001,10065):
+        xT_i = torch.load("dataset/Poisson/seed_"+str(i)+".pt")
+        # Sampling of f_T with DDRM
+        xT_i[1] = torch.FloatTensor(laplacian_spectral_bc(xT_i[0]))
+        data_list.append(xT_i)
+    xT = torch.stack(data_list)
+    y = None
+    for i in range(sampling_steps):
+        gen_images = diffusion.sample_from_restoration_process(
+            model, xT, sampling_steps, {"y": y, "sigma_y": args.sigma_y, "eta": args.eta, "eta_b": args.eta_b}, args.ddim
+        )
     return (gen_images, None)
 
 def main():
@@ -321,9 +478,20 @@ def main():
     parser.add_argument(
         "--sampling-only",
         action="store_true",
-        default=True,
+        default=False,
         help="No training, just sample images (will save them in --save-dir)",
     )
+    parser.add_argument(
+        "--restoration-only",
+        action="store_true",
+        default=True,
+        help="No training, just restore images (will save them in --save-dir)",
+    )
+    # Restoration arguments
+    parser.add_argument("--sigma_y", default=float(1e-5), type=float)
+    parser.add_argument("--eta_b", default=0.9, type=float)
+    parser.add_argument("--eta", default=0.8, type=float)
+
     parser.add_argument(
         "--num-sampled-images",
         type=int,
@@ -393,6 +561,27 @@ def main():
     # sampling
     if args.sampling_only:
         sampled_images, labels = sample_N_images(
+            args.num_sampled_images,
+            model,
+            diffusion,
+            None,
+            args.sampling_steps,
+            args.batch_size,
+            metadata.num_channels,
+            metadata.image_size,
+            metadata.num_classes,
+            args,
+        )
+        torch.save(sampled_images,
+                    os.path.join(
+                        args.save_dir,
+                        f"{args.arch}_{args.dataset}-{args.diffusion_steps}_steps-{args.sampling_steps}-sampling_steps-class_condn_{args.class_cond}.pt",
+                    ))
+        return
+
+    # restoration
+    if args.restoring_only:
+        sampled_images, labels = restore_N_images(
             args.num_sampled_images,
             model,
             diffusion,
