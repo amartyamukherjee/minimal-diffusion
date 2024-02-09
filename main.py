@@ -4,6 +4,7 @@ import math
 import argparse
 import numpy as np
 from scipy import sparse
+from scipy.fft import dst, idst
 from scipy.interpolate import RegularGridInterpolator
 from time import time
 from tqdm import tqdm
@@ -21,21 +22,63 @@ import unets
 
 unsqueeze3x = lambda x: x[..., None, None, None]
 
-# Define the wavenumbers
-kx = 2 * np.pi * np.fft.fftfreq(64, d=1/63)
-ky = 2 * np.pi * np.fft.fftfreq(64, d=1/63)
+def laplace_dst(u):
+    # Create grid
+    Lx = Ly = 1
+    nx = ny = 64
 
-kx,ky = np.meshgrid(kx, ky)
+    x = np.linspace(0, Lx, nx, endpoint=False)[1:]  # Exclude 0 to fit DST
+    y = np.linspace(0, Ly, ny, endpoint=False)[1:]
+    X, Y = np.meshgrid(x, y)
+    u_interior = u[1:-1,1:-1]
 
-def laplacian_spectral_bc(u,sigma=1):
-    # Compute the 2D Fourier transform of u
-    u_hat = np.fft.fft2(u[:,:])
+    # Apply DST to f
+    U_sine = dst(dst(u_interior, axis=0), axis=1)
 
-    # Compute Laplacian in Fourier space
-    laplacian_u_hat = -(kx**2 + ky**2) * u_hat
-    laplacian_u = np.real(np.fft.ifft2(laplacian_u_hat))
+    # Coefficients for Laplacian in sine space
+    a, b = np.pi * np.arange(1, nx-1), np.pi * np.arange(1, ny-1)
+    A, B = np.meshgrid(a, b)
+    laplacian_coeff = 2 * nx * (np.cos(A / nx) - 1) + 2 * ny * (np.cos(B / ny) - 1)
 
-    return np.clip(laplacian_u,-1,1)
+    # Solve for u in sine space
+    F_sine = U_sine * laplacian_coeff
+
+    # Apply inverse DST to get u
+    f = np.zeros((nx,ny))
+    f[1:-1,1:-1] = idst(idst(F_sine, axis=0), axis=1) / (nx)
+
+    rgi = RegularGridInterpolator((np.linspace(0, 1, 62), np.linspace(0, 1, 62)), idst(idst(F_sine, axis=0), axis=1) / (nx))
+
+    pts = np.stack([i for i in np.meshgrid(np.linspace(0,1,64),np.linspace(0,1,64))], axis=2)
+    
+    return rgi(pts).T
+
+def laplace_dst2(f):
+    # Create grid
+    Lx = Ly = 1
+    nx = ny = 64
+
+    x = np.linspace(0, Lx, nx, endpoint=False)[1:]  # Exclude 0 to fit DST
+    y = np.linspace(0, Ly, ny, endpoint=False)[1:]
+    X, Y = np.meshgrid(x, y)
+    f_interior = f[1:-1,1:-1]
+
+    # Apply DST to f
+    F_sine = dst(dst(f_interior, axis=0), axis=1)
+
+    # Coefficients for Laplacian in sine space
+    a, b = np.pi * np.arange(1, nx-1), np.pi * np.arange(1, ny-1)
+    A, B = np.meshgrid(a, b)
+    laplacian_coeff = 2 * nx * (np.cos(A / nx) - 1) + 2 * ny * (np.cos(B / ny) - 1)
+
+    # Solve for u in sine space
+    U_sine = F_sine / laplacian_coeff
+
+    # Apply inverse DST to get u
+    u = np.zeros((nx,ny))
+    u[1:-1,1:-1] = idst(idst(U_sine, axis=0), axis=1) / (nx)
+
+    return u
 
 class GuassianDiffusion:
     """Gaussian diffusion process with 1) Cosine schedule for beta values (https://arxiv.org/abs/2102.09672)
@@ -202,14 +245,25 @@ class GuassianDiffusion:
         model.eval()
         final = xT
         u = xT[:,0,:,:]
+        # f = xT[:,1,:,:]
 
         # Restoration arguments
         sigma_f = model_kwargs["sigma_y"]
         eta = model_kwargs["eta"]
         eta_b = model_kwargs["eta_b"]
 
+        del model_kwargs["sigma_y"]
+        del model_kwargs["eta"]
+        del model_kwargs["eta_b"]
+
+        # Create grid
+        x = np.linspace(0, 1, 64, endpoint=False)[1:]  # Exclude 0 to fit DST
+        y = np.linspace(0, 1, 64, endpoint=False)[1:]
+        X, Y = np.meshgrid(x, y)
+
         # sub-sampling timesteps for faster sampling
-        timesteps = timesteps or self.timesteps
+        # timesteps = timesteps or self.timesteps
+        timesteps = 10
         new_timesteps = np.linspace(
             0, 4*timesteps - 1, num=timesteps, endpoint=True, dtype=int
         )
@@ -222,30 +276,55 @@ class GuassianDiffusion:
         )
 
         for i, t in zip(np.arange(timesteps)[::-1], new_timesteps[::-1]):
-            print(t)
+            print(i,t)
             with torch.no_grad():
                 current_t = torch.tensor([t] * len(final), device=final.device)
                 current_sub_t = torch.tensor([i] * len(final), device=final.device)
 
                 x_theta = self.sample_from_reverse_process(
-                    model, final, timesteps=timesteps-t, model_kwargs=model_kwargs, ddim=ddim
+                    model, final, timesteps, model_kwargs=model_kwargs, ddim=ddim
                 )
 
-                new_kx = kx.copy()
-                new_ky = ky.copy()
-
                 sigma_t = np.sqrt(scalars["alpha_bar"][current_sub_t - 1])
-                k_index = sigma_t < sigma_f*(kx**2+ky**2)
-                not_k_index = sigma_t >= sigma_f*(kx**2+ky**2)
+                sigma_t0 = sigma_t[0].item()
                 
                 for n in range(x_theta.shape[0]):
                     u_i = x_theta[n,0,:,:].numpy()
-                    u_bar_i = np.fft.fft2(u_bar_i)
-                    f_theta_i = x_theta[n,1,:,:].numpy()
-                    f_theta_i_bar = np.fft.fft2(f_theta_i)
 
-                    f_theta_i_bar[k_index] = f_theta_i_bar[k_index] + np.sqrt(1-eta**2)*sigma_t*(kx[k_index]**2+ky[k_index]**2)*(u_bar_i[k_index]-f_theta_i_bar[k_index])
-                    f_theta_i_bar[not_k_index] = (1-eta_b)*f_theta_i_bar[not_k_index] + eta_b*u_bar_i[not_k_index]
+                    u_interior = u_i[1:-1,1:-1]
+
+                    # Apply DST to f
+                    U_sine = dst(dst(u_interior, axis=0), axis=1)
+
+                    # Coefficients for Laplacian in sine space
+                    a, b = np.pi * np.arange(1, 64-1), np.pi * np.arange(1, 64-1)
+                    A, B = np.meshgrid(a, b)
+                    laplacian_coeff = 2 * 64 * (np.cos(A / 64) - 1) + 2 * 64 * (np.cos(B / 64) - 1)
+
+                    # Solve for u in sine space
+                    F_sine = U_sine * laplacian_coeff
+
+                    # Apply inverse DST to get u
+                    f = np.zeros((64,64))
+                    f[1:-1,1:-1] = idst(idst(F_sine, axis=0), axis=1) / (64)
+
+                    f_theta_i = x_theta[n,1,:,:].numpy()
+                    f_theta_i_bar = dst(dst(f_theta_i[1:-1,1:-1], axis=0), axis=1)
+
+                    sampling_cond1 = sigma_t0 <  sigma_f * laplacian_coeff
+                    sampling_cond2 = sigma_t0 >= sigma_f * laplacian_coeff
+
+                    if len(sampling_cond1) > 0:
+                        f_theta_i_bar[sampling_cond1] = f_theta_i_bar[sampling_cond1] + np.sqrt(1-eta**2)*sigma_t0*(F_sine[sampling_cond1] - f_theta_i_bar[sampling_cond1])/(sigma_f*laplacian_coeff[sampling_cond1])
+                        f_theta_i_bar[sampling_cond1] += np.random.normal(0,eta*sigma_t0,size=f_theta_i_bar[sampling_cond1].shape)
+
+                    if len(sampling_cond2) > 0:
+                        f_theta_i_bar[sampling_cond2] = (1-eta_b)*f_theta_i_bar[sampling_cond2] + eta_b*F_sine[sampling_cond2]
+                        f_theta_i_bar[sampling_cond2] += np.random.normal(0,np.sqrt(sigma_t0**2 - sigma_f**2*laplacian_coeff[sampling_cond2]**2*eta_b**2))
+
+                    f_theta_i[1:-1,1:-1] = idst(idst(f_theta_i_bar, axis=0), axis=1) / (64)
+                    x_theta[n,0,0,:] = x_theta[n,0,:,0] = x_theta[n,0,-1,:] = x_theta[n,0,:,-1] = 0
+                    x_theta[n,0,1:-1,1:-1] = torch.FloatTensor(f_theta_i.reshape(64,64))
 
                 pred_epsilon = model(final, current_t, **model_kwargs)
                 # using xt+x0 to derive mu_t, instead of using xt+eps (former is more stable)
@@ -272,7 +351,136 @@ class GuassianDiffusion:
                             scalars.beta_tilde[current_sub_t].sqrt()
                         ) * torch.randn_like(final)
                 final = final.detach()
-                final[:,0,:,:] = u
+                final[:,0,:,:] = f
+        return final
+
+    def sample_from_restoration_process2(
+        self, model, xT, timesteps=None, model_kwargs={}, ddim=False
+    ):
+        """Sampling images by iterating over all timesteps.
+
+        model: diffusion model
+        xT: Starting noise vector.
+        timesteps: Number of sampling steps (can be smaller the default,
+            i.e., timesteps in the diffusion process).
+        model_kwargs: Additional kwargs for model (using it to feed class label for conditioning)
+        ddim: Use ddim sampling (https://arxiv.org/abs/2010.02502). With very small number of
+            sampling steps, use ddim sampling for better image quality.
+
+        Return: An image tensor with identical shape as XT.
+        """
+        model.eval()
+        final = xT
+        # u = xT[:,0,:,:]
+        f = xT[:,1,:,:]
+
+        # Restoration arguments
+        sigma_f = model_kwargs["sigma_y"]
+        eta = model_kwargs["eta"]
+        eta_b = model_kwargs["eta_b"]
+
+        del model_kwargs["sigma_y"]
+        del model_kwargs["eta"]
+        del model_kwargs["eta_b"]
+
+        # Create grid
+        x = np.linspace(0, 1, 64, endpoint=False)[1:]  # Exclude 0 to fit DST
+        y = np.linspace(0, 1, 64, endpoint=False)[1:]
+        X, Y = np.meshgrid(x, y)
+
+        # sub-sampling timesteps for faster sampling
+        # timesteps = timesteps or self.timesteps
+        timesteps = 10
+        new_timesteps = np.linspace(
+            0, 4*timesteps - 1, num=timesteps, endpoint=True, dtype=int
+        )
+        alpha_bar = self.scalars["alpha_bar"][new_timesteps]
+        new_betas = 1 - (
+            alpha_bar / torch.nn.functional.pad(alpha_bar, [1, 0], value=1.0)[:-1]
+        )
+        scalars = self.get_all_scalars(
+            self.alpha_bar_scheduler, timesteps, self.device, new_betas
+        )
+
+        for i, t in zip(np.arange(timesteps)[::-1], new_timesteps[::-1]):
+            print(i,t)
+            with torch.no_grad():
+                current_t = torch.tensor([t] * len(final), device=final.device)
+                current_sub_t = torch.tensor([i] * len(final), device=final.device)
+
+                x_theta = self.sample_from_reverse_process(
+                    model, final, timesteps, model_kwargs=model_kwargs, ddim=ddim
+                )
+
+                sigma_t = np.sqrt(scalars["alpha_bar"][current_sub_t - 1])
+                sigma_t0 = sigma_t[0].item()
+                
+                for n in range(x_theta.shape[0]):
+                    f_i = x_theta[n,1,:,:].numpy()
+
+                    f_interior = f_i[1:-1,1:-1]
+
+                    # Apply DST to f
+                    F_sine = dst(dst(f_interior, axis=0), axis=1)
+
+                    # Coefficients for Laplacian in sine space
+                    a, b = np.pi * np.arange(1, 64-1), np.pi * np.arange(1, 64-1)
+                    A, B = np.meshgrid(a, b)
+                    laplacian_coeff = 2 * 64 * (np.cos(A / 64) - 1) + 2 * 64 * (np.cos(B / 64) - 1)
+
+                    # Solve for u in sine space
+                    U_sine = F_sine / laplacian_coeff
+
+                    # Apply inverse DST to get u
+                    u = np.zeros((64,64))
+                    u[1:-1,1:-1] = idst(idst(U_sine, axis=0), axis=1) / (64)
+
+                    u_theta_i = x_theta[n,0,:,:].numpy()
+                    u_theta_i_bar = dst(dst(u_theta_i[1:-1,1:-1], axis=0), axis=1)
+
+                    k_bar = (1/np.abs(laplacian_coeff) + np.log(2)*np.max(A,B)/np.pi) / np.abs(laplacian_coeff)
+
+                    sampling_cond1 = sigma_t0 <  sigma_f * k_bar / laplacian_coeff
+                    sampling_cond2 = sigma_t0 >= sigma_f * k_bar / laplacian_coeff
+
+                    if len(sampling_cond1) > 0:
+                        u_theta_i_bar[sampling_cond1] = u_theta_i_bar[sampling_cond1] + np.sqrt(1-eta**2)*sigma_t0*(U_sine[sampling_cond1] - u_theta_i_bar[sampling_cond1])/(sigma_f*k_bar[sampling_cond1]/laplacian_coeff[sampling_cond1])
+                        u_theta_i_bar[sampling_cond1] += np.random.normal(0,eta*sigma_t0,size=u_theta_i_bar[sampling_cond1].shape)
+
+                    if len(sampling_cond2) > 0:
+                        u_theta_i_bar[sampling_cond2] = (1-eta_b)*u_theta_i_bar[sampling_cond2] + eta_b*U_sine[sampling_cond2]
+                        u_theta_i_bar[sampling_cond2] += np.random.normal(0,np.sqrt(sigma_t0**2 - sigma_f**2*k_bar[sampling_cond2]**2/laplacian_coeff[sampling_cond2]**2*eta_b**2))
+
+                    u_theta_i[1:-1,1:-1] = idst(idst(u_theta_i_bar, axis=0), axis=1) / (64)
+                    x_theta[n,0,0,:] = x_theta[n,0,:,0] = x_theta[n,0,-1,:] = x_theta[n,0,:,-1] = 0
+                    x_theta[n,0,1:-1,1:-1] = torch.FloatTensor(u_theta_i.reshape(64,64))
+
+                pred_epsilon = model(final, current_t, **model_kwargs)
+                # using xt+x0 to derive mu_t, instead of using xt+eps (former is more stable)
+                pred_x0 = self.get_x0_from_xt_eps(
+                    final, pred_epsilon, current_sub_t, scalars
+                )
+                pred_mean = self.get_pred_mean_from_x0_xt(
+                    final, pred_x0, current_sub_t, scalars
+                )
+                if i == 0:
+                    final = pred_mean
+                else:
+                    if ddim:
+                        final = (
+                            unsqueeze3x(scalars["alpha_bar"][current_sub_t - 1]).sqrt()
+                            * pred_x0
+                            + (
+                                1 - unsqueeze3x(scalars["alpha_bar"][current_sub_t - 1])
+                            ).sqrt()
+                            * pred_epsilon
+                        )
+                    else:
+                        final = pred_mean + unsqueeze3x(
+                            scalars.beta_tilde[current_sub_t].sqrt()
+                        ) * torch.randn_like(final)
+                final = final.detach()
+                final[:,1,:,:] = f
         return final
 
 
@@ -421,15 +629,15 @@ def restore_N_images(
     samples, labels, num_samples = [], [], 0
     N = 64
     data_list = []
-    for i in range(10001,10065):
+    for i in range(10001,10001+N):
         xT_i = torch.load("dataset/Poisson/seed_"+str(i)+".pt")
         # Sampling of f_T with DDRM
-        xT_i[1] = torch.FloatTensor(laplacian_spectral_bc(xT_i[0]))
+        xT_i[0] = torch.FloatTensor(laplace_dst2(xT_i[1]))
         data_list.append(xT_i)
     xT = torch.stack(data_list)
     y = None
-    for i in range(sampling_steps):
-        gen_images = diffusion.sample_from_restoration_process(
+    for i in range(5):
+        gen_images = diffusion.sample_from_restoration_process2(
             model, xT, sampling_steps, {"y": y, "sigma_y": args.sigma_y, "eta": args.eta, "eta_b": args.eta_b}, args.ddim
         )
     return (gen_images, None)
@@ -488,8 +696,8 @@ def main():
         help="No training, just restore images (will save them in --save-dir)",
     )
     # Restoration arguments
-    parser.add_argument("--sigma_y", default=float(1e-5), type=float)
-    parser.add_argument("--eta_b", default=0.9, type=float)
+    parser.add_argument("--sigma-y", default=float(1e-5), type=float)
+    parser.add_argument("--eta-b", default=0.9, type=float)
     parser.add_argument("--eta", default=0.8, type=float)
 
     parser.add_argument(
@@ -580,7 +788,7 @@ def main():
         return
 
     # restoration
-    if args.restoring_only:
+    if args.restoration_only:
         sampled_images, labels = restore_N_images(
             args.num_sampled_images,
             model,
