@@ -3,13 +3,18 @@ import cv2
 import copy
 import math
 import argparse
+from matplotlib import pyplot as plt
 import numpy as np
 from time import time
 from tqdm import tqdm
 from easydict import EasyDict
+from PIL import Image
 
 import torch
 import torch.distributed as dist
+from torch import nn
+import torch.nn.functional as F
+from torch.optim import Adam
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -19,6 +24,165 @@ import unets
 
 unsqueeze3x = lambda x: x[..., None, None, None]
 
+x = y = np.linspace(-1,1,64)
+xx,yy = np.meshgrid(x,y)
+xx_t,yy_t = torch.Tensor(xx),torch.Tensor(yy)
+coords = torch.stack((xx_t,yy_t)).view(2,-1)
+
+class Pendulum(nn.Module):
+    def __init__(self):
+        super().__init__()
+        x = y = np.linspace(-1,1,64)
+        xx,yy = np.meshgrid(x,y)
+        self.xx = torch.Tensor(xx).to("cuda:0")
+        self.yy = torch.Tensor(yy).to("cuda:0")
+        self.m = 0.15
+        self.g = 9.81
+        self.l = 0.5
+        # self.l = self.g
+
+        self.register_parameter("phi1", nn.Parameter(torch.randn(())))
+        self.register_parameter("phi2", nn.Parameter(torch.randn(())))
+        # self.register_parameter("phi3", nn.Parameter(torch.randn(())))
+        self.coeffs = {name: param for name, param in self.named_parameters()}
+    
+    def forward(self,V):
+        control = 5 * F.tanh(self.coeffs["phi1"]*self.xx) + 5 * F.tanh(self.coeffs["phi2"]*self.yy)
+        f1 = self.yy
+        f2 = self.g*torch.sin(self.xx)/self.l + (control - 0.1*self.yy) / (self.m*self.l*self.l)
+        # f3 = torch.zeros_like(self.xx)
+        return torch.stack((f1,f2,V.to("cuda:0")))
+    
+    def true_lyap_fn(self):
+        V = (torch.cos(self.xx)-1)/self.l-2.5/(self.coeffs["phi1"])*torch.log(torch.cosh(self.coeffs["phi1"]*self.xx)) + self.yy*self.yy/2
+        return V
+
+class NoisyPendulum(nn.Module):
+    def __init__(self):
+        super().__init__()
+        x = y = np.linspace(-1,1,64)
+        xx,yy = np.meshgrid(x,y)
+        self.xx = torch.Tensor(xx).to("cuda:0")
+        self.yy = torch.Tensor(yy).to("cuda:0")
+        self.m = 0.15
+        self.g = 9.81
+        self.l = 0.5
+        # self.l = self.g
+
+        self.register_parameter("phi1", nn.Parameter(torch.randn(())))
+        self.register_parameter("phi2", nn.Parameter(torch.randn(())))
+        # self.register_parameter("phi3", nn.Parameter(torch.randn(())))
+        self.coeffs = {name: param for name, param in self.named_parameters()}
+    
+    def forward(self,V):
+        m = self.m + np.random.uniform(low=-0.05, high=0.05)
+        g = self.g + np.random.uniform(low=-0.05, high=0.05)
+        l = self.l + np.random.uniform(low=-0.05, high=0.05)
+        control = 5 * F.tanh(self.coeffs["phi1"]*self.xx) + 5 * F.tanh(self.coeffs["phi2"]*self.yy)
+        noise = torch.rand(())*0.1-0.05
+        control *= 1+noise
+        f1 = self.yy
+        f2 = g*torch.sin(self.xx)/l + (control - 0.1*self.yy) / (m*l*l)
+        # f3 = torch.zeros_like(self.xx)
+        return torch.stack((f1,f2,V.to("cuda:0")))
+    
+    def true_lyap_fn(self):
+        V = (torch.cos(self.xx)-1)/self.l-2.5/(self.coeffs["phi1"])*torch.log(torch.cosh(self.coeffs["phi1"]*self.xx)) + self.yy*self.yy/2
+        return V
+
+class Duffing(nn.Module):
+    def __init__(self):
+        super().__init__()
+        x = y = np.linspace(-1,1,64)
+        xx,yy = np.meshgrid(x,y)
+        self.xx = torch.Tensor(xx).to("cuda:0")
+        self.yy = torch.Tensor(yy).to("cuda:0")
+
+        self.register_parameter("phi1", nn.Parameter(torch.randn(())))
+        self.register_parameter("phi2", nn.Parameter(torch.randn(())))
+        # self.register_parameter("phi3", nn.Parameter(torch.randn(())))
+        self.coeffs = {name: param for name, param in self.named_parameters()}
+    
+    def forward(self,V):
+        # control = 20 * F.tanh(self.coeffs["phi1"]*self.xx + self.coeffs["phi2"]*self.yy)
+        control = 20 * F.tanh(self.coeffs["phi1"]*self.xx) + 20 * F.tanh(self.coeffs["phi2"]*self.yy)
+        f1 = self.yy
+        f2 = -0.5*self.yy - self.xx * (4*self.xx*self.xx - 1) + 0.5 * control
+        # f3 = torch.zeros_like(self.xx)
+        return torch.stack((f1,f2,V.to("cuda:0")))
+
+class VanDerPol(nn.Module):
+    def __init__(self):
+        super().__init__()
+        x = y = np.linspace(-1,1,64)
+        xx,yy = np.meshgrid(x,y)
+        self.xx = torch.Tensor(xx).to("cuda:0")
+        self.yy = torch.Tensor(yy).to("cuda:0")
+
+        self.register_parameter("phi1", nn.Parameter(torch.randn(())))
+        self.register_parameter("phi2", nn.Parameter(torch.randn(())))
+        # self.register_parameter("phi3", nn.Parameter(torch.randn(())))
+        self.coeffs = {name: param for name, param in self.named_parameters()}
+    
+    def forward(self,V):
+        # control = 20 * F.tanh(self.coeffs["phi1"]*self.xx + self.coeffs["phi2"]*self.yy)
+        control = 20 * F.tanh(self.coeffs["phi1"]*self.xx) + 20 * F.tanh(self.coeffs["phi2"]*self.yy)
+        f1 = 2*self.yy
+        f2 = -0.8*self.xx + 2*self.yy - 10*self.xx*self.xx*self.yy + control
+        # f3 = torch.zeros_like(self.xx)
+        return torch.stack((f1,f2,V.to("cuda:0")))
+
+def plot_fn_lyap(img,fig_title,v=None):
+    if v is None:
+        fig, ax = plt.subplots(1,3,figsize=(12, 4))
+    else:
+        fig, ax = plt.subplots(1,4,figsize=(16, 4))
+        v = v / v.abs().max()
+        v = v.detach().cpu().numpy()
+
+    img = img.detach().cpu().numpy()
+    f1 = img[0]
+    f2 = img[1]
+    V = img[2]
+
+    ax[0].imshow(f1)
+    ax[0].set(title="f1")
+    ax[1].imshow(f2)
+    ax[1].set(title="f2")
+    ax[2].imshow(V)
+    ax[2].set(title="DDIM V")
+    if v is not None:
+        ax[3].imshow(v)
+        ax[3].set(title="True V")
+        cbar3 = fig.colorbar(ax[3].imshow(v), ax=ax[3])
+
+
+    cbar0 = fig.colorbar(ax[0].imshow(f1), ax=ax[0])
+    cbar1 = fig.colorbar(ax[1].imshow(f2), ax=ax[1])
+    cbar2 = fig.colorbar(ax[2].imshow(V), ax=ax[2])
+
+    plt.savefig(fig_title)
+
+def plot_fn_step(final,pred_x0,t):
+    f1 = final[0,0,:,:].detach().cpu().numpy()
+    f2 = final[0,1,:,:].detach().cpu().numpy()
+
+    f0_1 = pred_x0[0,0,:,:].detach().cpu().numpy()
+    f0_2 = pred_x0[0,1,:,:].detach().cpu().numpy()
+
+    V = pred_x0[0,2,:,:].detach().cpu().numpy()
+
+    img_dict = {
+        "f1":f1,
+        "f2":f2,
+        "f0_1":f0_1,
+        "f0_2":f0_2,
+        "V":V,
+    }
+
+    for k,v in img_dict.items():
+        plt.imshow(v)
+        plt.savefig("paper_figs/"+k+"_"+str(t)+".png")
 
 class GuassianDiffusion:
     """Gaussian diffusion process with 1) Cosine schedule for beta values (https://arxiv.org/abs/2102.09672)
@@ -118,7 +282,15 @@ class GuassianDiffusion:
         Return: An image tensor with identical shape as XT.
         """
         model.eval()
-        final = xT
+        # final = xT
+
+        p = NoisyPendulum().to("cuda:0")
+        opt = Adam(p.parameters(), lr=0.1)
+        vT = torch.randn((64,64))
+
+        final = p(vT).unsqueeze(0)
+        norm = final[0,:2,:,:].abs().max().detach()
+        final = final / norm
 
         # sub-sampling timesteps for faster sampling
         timesteps = timesteps or self.timesteps
@@ -134,34 +306,37 @@ class GuassianDiffusion:
         )
 
         for i, t in zip(np.arange(timesteps)[::-1], new_timesteps[::-1]):
-            with torch.no_grad():
-                current_t = torch.tensor([t] * len(final), device=final.device)
-                current_sub_t = torch.tensor([i] * len(final), device=final.device)
-                pred_epsilon = model(final, current_t, **model_kwargs)
-                # using xt+x0 to derive mu_t, instead of using xt+eps (former is more stable)
-                pred_x0 = self.get_x0_from_xt_eps(
-                    final, pred_epsilon, current_sub_t, scalars
-                )
-                pred_mean = self.get_pred_mean_from_x0_xt(
-                    final, pred_x0, current_sub_t, scalars
-                )
-                if i == 0:
-                    final = pred_mean
-                else:
-                    if ddim:
-                        final = (
-                            unsqueeze3x(scalars["alpha_bar"][current_sub_t - 1]).sqrt()
-                            * pred_x0
-                            + (
-                                1 - unsqueeze3x(scalars["alpha_bar"][current_sub_t - 1])
-                            ).sqrt()
-                            * pred_epsilon
-                        )
-                    else:
-                        final = pred_mean + unsqueeze3x(
-                            scalars.beta_tilde[current_sub_t].sqrt()
-                        ) * torch.randn_like(final)
-                final = final.detach()
+            # print(t)
+            # with torch.no_grad():
+            current_t = torch.tensor([t] * len(final), device=final.device)
+            current_sub_t = torch.tensor([i] * len(final), device=final.device)
+            pred_epsilon = model(final, current_t, **model_kwargs).detach()
+            # using xt+x0 to derive mu_t, instead of using xt+eps (former is more stable)
+            pred_x0 = self.get_x0_from_xt_eps(
+                final, pred_epsilon, current_sub_t, scalars
+            )
+            pred_x0_f = pred_x0[:,0:2,:,:]
+            # print(final[0,1,:,:])
+            # print(pred_x0_f[0,1,:,:])
+            pred_x0_V = pred_x0[0,2,:,:]
+
+            loss = F.mse_loss(final[:,0:2,:,:],pred_x0_f)
+            opt.zero_grad()
+            loss.backward(retain_graph=True)
+            opt.step()
+            print("LOSS: ", loss.item(), "PARAMS: ", {"phi1": p.coeffs["phi1"].item(), "phi2": p.coeffs["phi2"].item()})
+
+            # if t in [970,942,898]:
+            #     plot_fn_step(final,pred_x0,t)
+
+            final = p(pred_x0_V).unsqueeze(0)
+            norm = final[0,:2,:,:].abs().max().detach()
+            final[0,:2,:,:] = final[0,:2,:,:] / norm
+
+        final = p(pred_x0_V).detach()
+        plot_fn_lyap(final, "lyap_results.png")
+        # plot_fn_lyap(final, "lyap_results2.png", p.true_lyap_fn().detach())
+        print("img saved in lyap_results.png")
         return final
 
 
@@ -199,11 +374,15 @@ def train_one_epoch(
     model.train()
     for step, images in enumerate(dataloader):
         # must use [-1, 1] pixel range for images
-        if args.dataset in ["poisson","lyapunov"]:
+        if args.dataset in ["poisson","darcy","lyapunov"]:
             images, labels = (
                 images.to(args.device),
                 labels.to(args.device) if args.class_cond else None,
             )
+            if args.dataset == "darcy":
+                images = images / 2.06
+            if args.dataset == "lyapunov":
+                images = images / images.max().abs()
         else:
             images, labels = images
             assert (images.max().item() <= 1) and (0 <= images.min().item())
@@ -232,7 +411,6 @@ def train_one_epoch(
                     args.ema_w * args.ema_dict[k] + (1 - args.ema_w) * new_dict[k]
                 )
             logger.log(loss.item(), display=not step % 100)
-
 
 def sample_N_images(
     N,
@@ -263,6 +441,7 @@ def sample_N_images(
 
     Returns: Numpy array with N images and corresponding labels.
     """
+    N = 1
     samples, labels, num_samples = [], [], 0
     num_processes, group = dist.get_world_size(), dist.group.WORLD
     with tqdm(total=math.ceil(N / (args.batch_size * num_processes))) as pbar:
@@ -289,13 +468,13 @@ def sample_N_images(
                 labels.append(torch.cat(labels_list).detach().cpu().numpy())
 
             dist.all_gather(samples_list, gen_images, group)
-            if args.dataset in ["poisson","lyapunov"]:
+            if args.dataset in ["poisson","darcy","lyapunov"]:
                 samples.append(torch.cat(samples_list).detach().cpu())
             else:
                 samples.append(torch.cat(samples_list).detach().cpu().numpy())
             num_samples += len(xT) * num_processes
             pbar.update(1)
-    if args.dataset in ["poisson","lyapunov"]:
+    if args.dataset in ["poisson","darcy","lyapunov"]:
         samples = torch.cat(samples)
     else:
         samples = np.concatenate(samples).transpose(0, 2, 3, 1)[:N]
@@ -306,7 +485,7 @@ def sample_N_images(
 def main():
     parser = argparse.ArgumentParser("Minimal implementation of diffusion models")
     # diffusion model
-    parser.add_argument("--arch", type=str, help="Neural network architecture", default="UNet")
+    parser.add_argument("--arch", default="UNet", type=str, help="Neural network architecture")
     parser.add_argument(
         "--class-cond",
         action="store_true",
@@ -328,11 +507,11 @@ def main():
     parser.add_argument(
         "--ddim",
         action="store_true",
-        default=False,
+        default=True,
         help="Sampling using DDIM update step",
     )
     # dataset
-    parser.add_argument("--dataset", type=str)
+    parser.add_argument("--dataset", type=str, default="lyapunov")
     parser.add_argument("--data-dir", type=str, default="./dataset/")
     # optimizer
     parser.add_argument(
@@ -342,12 +521,15 @@ def main():
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--ema_w", type=float, default=0.9995)
     # sampling/finetuning
-    parser.add_argument("--pretrained-ckpt", type=str, help="Pretrained model ckpt")
+    parser.add_argument("--pretrained-ckpt", 
+                        default="trained_models/UNet_lyapunov-epoch_500-timesteps_1000-class_condn_False.pt", 
+                        type=str, 
+                        help="Pretrained model ckpt")
     parser.add_argument("--delete-keys", nargs="+", help="Pretrained model ckpt")
     parser.add_argument(
         "--sampling-only",
         action="store_true",
-        default=False,
+        default=True,
         help="No training, just sample images (will save them in --save-dir)",
     )
     parser.add_argument(
@@ -418,6 +600,7 @@ def main():
 
     # sampling
     if args.sampling_only:
+        print(f"Sampling only")
         sampled_images, labels = sample_N_images(
             args.num_sampled_images,
             model,
@@ -494,7 +677,7 @@ def main():
                 args,
             )
             if args.local_rank == 0:
-                if args.dataset in ["poisson","lyapunov"]:
+                if args.dataset in ["poisson","darcy","lyapunov"]:
                     torch.save(sampled_images,
                                os.path.join(
                                     args.save_dir,

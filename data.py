@@ -110,6 +110,16 @@ def get_metadata(name):
                 "num_channels": 2,
             }
         )
+    elif name == "lyapunov":
+        metadata = EasyDict(
+            {
+                "image_size": 64,
+                "num_classes": 1,
+                "train_images": 2000,
+                "val_images": 1000,
+                "num_channels": 3,
+            }
+        )
     else:
         raise ValueError(f"{name} dataset nor supported!")
     return metadata
@@ -164,6 +174,28 @@ class PoissonDataset(Dataset):
 
         return data
 
+class LyapunovDataset(Dataset):
+    def __init__(self, transform=None):
+        self.folder_path = "dataset/Lyapunov"
+        self.file_list = [file for file in os.listdir(self.folder_path) if file.endswith('.pt') and "test" not in file]
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.file_list)
+
+    def __getitem__(self, idx):
+        file_name = self.file_list[idx]
+        file_path = os.path.join(self.folder_path, file_name)
+        
+        # Load the .pt file
+        data = torch.load(file_path)
+        data.requires_grad = False
+
+        # Apply any transformations if needed
+        if self.transform:
+            data = self.transform(data)
+
+        return data
 
 # TODO: Add datasets imagenette/birds/svhn etc etc.
 def get_dataset(name, data_dir, metadata):
@@ -294,6 +326,16 @@ def get_dataset(name, data_dir, metadata):
         )
         train_set = PoissonDataset(
             transform=transform_train,
+        )
+    elif name == "lyapunov":
+        transform_train = transforms.Compose(
+            [
+                transforms.RandomVerticalFlip(),
+                transforms.RandomHorizontalFlip(),
+            ]
+        )
+        train_set = LyapunovDataset(
+            transform=None,
         )
     else:
         raise ValueError(f"{name} dataset nor supported!")
